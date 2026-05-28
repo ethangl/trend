@@ -9,6 +9,8 @@ results/
 .DS_Store
 book
 
+logs/
+
 # Xcode (per-user Xcode state, build output, sed backups)
 xcuserdata/
 *.xcuserstate
