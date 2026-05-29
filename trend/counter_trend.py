@@ -62,6 +62,26 @@ class CounterTrendStrategy:
         self.trades: list[TradeRecord] = []
         broker.set_on_fill(self._on_fill)
 
+    def to_state_dict(self) -> dict:
+        """Path-dependent state only. Derivable fields (closes, EMAs, std,
+        last_session_date) are recomputed by replay+catch-up, not persisted."""
+        return {
+            "state": self.state.name,
+            "entry_price": self.entry_price,
+            "entry_qty": self.entry_qty,
+            "days_held": self.days_held,
+            "pending_order_id": self.pending_order_id,
+            "trades": [t.to_dict() for t in self.trades],
+        }
+
+    def apply_state_dict(self, d: dict) -> None:
+        self.state = State[d["state"]]
+        self.entry_price = d["entry_price"]
+        self.entry_qty = d["entry_qty"]
+        self.days_held = d["days_held"]
+        self.pending_order_id = d["pending_order_id"]
+        self.trades = [TradeRecord.from_dict(t) for t in d["trades"]]
+
     def on_bar(self, bar: Bar) -> None:
         self.last_session_date = bar.ts.date()
         self.closes.append(bar.close)

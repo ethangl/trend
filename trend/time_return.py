@@ -63,6 +63,30 @@ class TimeReturnStrategy:
         self.trades: list[TradeRecord] = []
         broker.set_on_fill(self._on_fill)
 
+    # ---- persistence ----
+
+    def to_state_dict(self) -> dict:
+        """Path-dependent state only. Derivable fields (closes, last_month,
+        last_session_date) are recomputed by replay+catch-up, not persisted."""
+        return {
+            "state": self.state.name,
+            "entry_price": self.entry_price,
+            "entry_qty": self.entry_qty,
+            "pending_close_id": self.pending_close_id,
+            "pending_open_id": self.pending_open_id,
+            "pending_open_signed_qty": self.pending_open_signed_qty,
+            "trades": [t.to_dict() for t in self.trades],
+        }
+
+    def apply_state_dict(self, d: dict) -> None:
+        self.state = State[d["state"]]
+        self.entry_price = d["entry_price"]
+        self.entry_qty = d["entry_qty"]
+        self.pending_close_id = d["pending_close_id"]
+        self.pending_open_id = d["pending_open_id"]
+        self.pending_open_signed_qty = d["pending_open_signed_qty"]
+        self.trades = [TradeRecord.from_dict(t) for t in d["trades"]]
+
     # ---- bar handler ----
 
     def on_bar(self, bar: Bar) -> None:

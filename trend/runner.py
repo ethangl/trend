@@ -251,6 +251,106 @@ class Runner:
                     pass
         return reset
 
+    # ---- state persistence ----
+
+    _INFLIGHT_STATES = {"ENTRY_SENT", "EXIT_SENT", "PENDING"}
+
+    def snapshot_cells(self) -> list[dict]:
+        """Per-cell path-dependent state for persistence. Pairs with
+        apply_persisted_state. Broker bookkeeping + strategy state; derivable
+        fields (EMAs, deques, std) are omitted — they're rebuilt by replay."""
+        from datetime import date as _date
+
+        out: list[dict] = []
+        for cell in self.cells:
+            b = cell.broker
+            daily = getattr(b, "daily_realized", {}) or {}
+            out.append({
+                "strategy": cell.setup.strategy_name,
+                "symbol":   cell.setup.symbol,
+                "broker": {
+                    "position_qty":   b.position_qty,
+                    "position_avg":   b.position_avg,
+                    "total_realized": getattr(b, "total_realized", 0.0),
+                    "daily_realized": {
+                        (k.isoformat() if isinstance(k, _date) else str(k)): v
+                        for k, v in daily.items()
+                    },
+                    "fills":   [f.to_dict() for f in getattr(b, "fills", [])[-100:]],
+                    "next_id": getattr(b, "_next_id", 1),
+                },
+                "strategy_state": cell.strategy.to_state_dict(),
+            })
+        return out
+
+    def apply_persisted_state(self, cells_state: list[dict]) -> dict:
+        """Distribute persisted per-cell state onto brokers + strategies.
+
+        Returns a summary dict: applied cells, cells in state but missing from
+        this runner (skipped), cells in this runner missing from state (left at
+        default), and cells degraded because they were mid-order at save time.
+
+        Mid-order ('*_SENT'/'PENDING') cells can't be resumed faithfully — the
+        live broker's pending IB Trade (and its fill callback) is gone after a
+        restart. We degrade those to the cold-start behavior (force-flat broker
+        + reset strategy to FLAT) and rely on the post-load reconcile against
+        IB to HALT loudly if the order actually filled and left a position.
+        """
+        from datetime import date as _date
+
+        from .types import Fill
+
+        by_key = {(c["strategy"], c["symbol"]): c for c in cells_state}
+        runner_keys = {(c.setup.strategy_name, c.setup.symbol) for c in self.cells}
+
+        applied: list[str] = []
+        degraded: list[str] = []
+        for cell in self.cells:
+            key = (cell.setup.strategy_name, cell.setup.symbol)
+            cstate = by_key.get(key)
+            if cstate is None:
+                continue  # new cell — leave at replay default
+            b = cell.broker
+            bs = cstate["broker"]
+            b.position_qty = bs["position_qty"]
+            b.position_avg = bs["position_avg"]
+            if hasattr(b, "total_realized"):
+                b.total_realized = bs["total_realized"]
+            if hasattr(b, "daily_realized"):
+                b.daily_realized = {
+                    _date.fromisoformat(k): v
+                    for k, v in bs["daily_realized"].items()
+                }
+            if hasattr(b, "fills"):
+                b.fills = [Fill.from_dict(f) for f in bs["fills"]]
+            b._next_id = bs["next_id"]
+
+            cell.strategy.apply_state_dict(cstate["strategy_state"])
+
+            state_name = getattr(getattr(cell.strategy, "state", None), "name", "")
+            if state_name in self._INFLIGHT_STATES:
+                b.position_qty = 0
+                b.position_avg = 0.0
+                cell.strategy.state = type(cell.strategy.state).FLAT
+                for attr in ("pending_order_id", "pending_close_id",
+                             "pending_open_id"):
+                    if hasattr(cell.strategy, attr):
+                        setattr(cell.strategy, attr, None)
+                degraded.append(f"{key[0]}×{key[1]}")
+            else:
+                applied.append(f"{key[0]}×{key[1]}")
+
+        missing = sorted(f"{s}×{sym}" for (s, sym) in by_key
+                         if (s, sym) not in runner_keys)
+        new_cells = sorted(f"{s}×{sym}" for (s, sym) in runner_keys
+                           if (s, sym) not in by_key)
+        return {
+            "applied": applied,
+            "degraded": degraded,
+            "skipped_missing_from_runner": missing,
+            "new_cells_left_default": new_cells,
+        }
+
     def force_flat_all_cells(self) -> None:
         """Reset every cell's broker position to flat, without placing orders.
 

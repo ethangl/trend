@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import sys
 import time
 from datetime import date, datetime, time as dtime, timedelta
@@ -42,6 +43,9 @@ from scripts.run_daily_live import (  # noqa: E402
 from trend.commands import default_command_path, read_and_delete_command  # noqa: E402
 from trend.ib_broker import IBBroker  # noqa: E402
 from trend.ib_data import fetch_daily_bars  # noqa: E402
+from trend.persistence import (  # noqa: E402
+    StatePersistenceError, default_state_path, load_state, save_state,
+)
 from trend.reconcile import format_report  # noqa: E402
 from trend.runner import CellSetup, Runner, transfer_warm_state  # noqa: E402
 from trend.sim_broker import SimBroker  # noqa: E402
@@ -100,8 +104,11 @@ def process_command(cmd: dict, *, runner, ib, args) -> None:
                         pass
             log.warning("flattened %d positions, reset %d inflight strategies",
                         len(closed), unstuck)
+            _persist_state(runner, args)
         elif name == "restart":
-            log.warning("restart requested — exiting; supervisor will relaunch")
+            log.warning("restart requested — saving state and exiting; "
+                        "supervisor will relaunch")
+            _persist_state(runner, args)
             ib.disconnect()
             sys.exit(0)
         else:
@@ -110,6 +117,16 @@ def process_command(cmd: dict, *, runner, ib, args) -> None:
         raise
     except Exception as e:
         log.exception("command %s failed: %s", name, e)
+
+
+def _persist_state(runner, args) -> None:
+    """Best-effort atomic save of path-dependent state. Never raises — a failed
+    save must not crash a live tick or abort a shutdown."""
+    try:
+        save_state(args.state_path, runner, args)
+        log.info("saved state to %s", args.state_path)
+    except Exception as e:
+        log.warning("save_state failed: %s", e)
 
 
 def flatten_account(ib) -> list[tuple[str, int]]:
@@ -365,8 +382,12 @@ def main() -> int:
     p.add_argument("--client-id", type=int, default=14)
     p.add_argument("--portfolio", type=float, default=300_000.0)
     p.add_argument("--risk-factor", type=float, default=0.001)
-    p.add_argument("--run-hour", type=int, default=17, help="ET hour for daily tick")
-    p.add_argument("--run-minute", type=int, default=30, help="ET minute for daily tick")
+    # 18:15 ET is just after the 18:00 ET CME maintenance-halt reopen, so the
+    # day's bar is already settled (>17:05) AND the market is live — MARKET
+    # orders fill immediately instead of resting as _SENT through the
+    # 17:00–18:00 ET halt (which a restart would then degrade to flat).
+    p.add_argument("--run-hour", type=int, default=18, help="ET hour for daily tick")
+    p.add_argument("--run-minute", type=int, default=15, help="ET minute for daily tick")
     p.add_argument("--halt-threshold", type=int, default=0)
     p.add_argument("--catch-up-bars", type=int, default=15,
                    help="Trailing daily bars to fetch for startup catch-up")
@@ -386,6 +407,10 @@ def main() -> int:
                    help="Where to write status.json (read by the menubar app)")
     p.add_argument("--command-path", default=str(default_command_path()),
                    help="Where to read command.json from (written by the menubar app)")
+    p.add_argument("--state-path", default=str(default_state_path()),
+                   help="Where to persist/restore path-dependent state across "
+                        "restarts. If present and valid on startup, the loop "
+                        "resumes from it instead of force-flatting.")
     p.add_argument("--exit-on-orphan", action="store_true",
                    help="Exit if the parent process dies (orphaning us). "
                         "Use under a supervisor (the SwiftUI app) so a hard "
@@ -454,22 +479,59 @@ def main() -> int:
     )
     transfer_warm_state(sim_runner, live_runner)
 
-    first_run = not args.no_first_run
-    if first_run:
-        log.warning("FIRST RUN: forcing all cells flat after replay+catch-up")
-        live_runner.force_flat_all_cells()
-        unstuck = live_runner.reset_inflight_strategies()
-        if unstuck:
-            log.warning("reset %d strategies stuck in *_SENT state", unstuck)
+    # State persistence: if a valid state file exists, resume from it instead
+    # of force-flatting. A corrupt/wrong-schema file is fatal — we refuse to
+    # start rather than silently flatten (which could close real positions).
+    try:
+        persisted = load_state(args.state_path)
+    except StatePersistenceError as e:
+        ib.disconnect()
+        raise SystemExit(
+            f"FATAL: state file present but unusable: {e}\n"
+            f"Resolve manually (inspect/repair/delete {args.state_path}) "
+            f"then relaunch. Refusing to force-flat over real positions."
+        )
+
+    first_run = False
+    if persisted is not None:
+        log.warning("RESUMING from persisted state saved at %s",
+                    persisted.get("saved_at"))
+        summary = live_runner.apply_persisted_state(persisted["cells"])
+        args._paused = bool(persisted.get("global", {}).get("paused", False))
+        log.warning(
+            "restored %d cells (%d degraded mid-order), %d in-state cells "
+            "missing from runner, %d new cells left at default; paused=%s",
+            len(summary["applied"]), len(summary["degraded"]),
+            len(summary["skipped_missing_from_runner"]),
+            len(summary["new_cells_left_default"]), args._paused,
+        )
+        if summary["degraded"]:
+            log.warning("degraded (force-flat + reset to FLAT, reconcile will "
+                        "HALT if IB shows a position): %s", summary["degraded"])
+        if summary["skipped_missing_from_runner"]:
+            log.warning("state had cells not in this runner (skipped): %s",
+                        summary["skipped_missing_from_runner"])
+        if summary["new_cells_left_default"]:
+            log.warning("runner has cells not in state (left at replay default): %s",
+                        summary["new_cells_left_default"])
+    else:
+        first_run = not args.no_first_run
+        if first_run:
+            log.warning("FIRST RUN: forcing all cells flat after replay+catch-up")
+            live_runner.force_flat_all_cells()
+            unstuck = live_runner.reset_inflight_strategies()
+            if unstuck:
+                log.warning("reset %d strategies stuck in *_SENT state", unstuck)
 
     actual = ibkr_positions_by_symbol(ib)
     report = live_runner.reconcile_against(actual, halt_threshold=args.halt_threshold)
     print("\n" + format_report(report))
     log.info("startup reconcile severity=%s", report.overall.value)
 
-    # Fill cursor for cross-tick capture of late fills. Live IBBrokers start
-    # with empty .fills lists (transfer_warm_state does NOT copy fills), so
-    # starting at the current length is correct.
+    # Fill cursor for cross-tick capture of late fills. On a cold start live
+    # IBBrokers have empty .fills (transfer_warm_state does NOT copy fills); on
+    # a resume they hold the restored fills, already logged by the prior
+    # process. Either way the current length is the right starting cursor.
     fills_cursor = {id(c): len(c.broker.fills) for c in live_runner.cells}
 
     last_tick: dict | None = None
@@ -492,6 +554,7 @@ def main() -> int:
         if args.exit_on_orphan and os.getppid() != args._original_ppid:
             log.warning("parent (PID %d) died; exiting so we don't hold the IB clientId",
                         args._original_ppid)
+            _persist_state(live_runner, args)
             try:
                 state["ib"].disconnect()
             except Exception:
@@ -508,6 +571,19 @@ def main() -> int:
             emit_status("paused" if args._paused else "waiting")
             last_status_at[0] = now
 
+    # On a clean shutdown (supervisor SIGTERM on app quit), persist one final
+    # snapshot before exiting so the next launch resumes instead of flatting.
+    def _on_sigterm(signum, frame):
+        log.warning("SIGTERM received — saving state and exiting cleanly")
+        _persist_state(live_runner, args)
+        try:
+            state["ib"].disconnect()
+        except Exception:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
     emit_status("starting")
 
     # ---- Tick loop ----
@@ -520,6 +596,7 @@ def main() -> int:
             "orders_placed": len(once_run.orders_placed),
             "fills_received": len(once_run.fills_received),
         }
+        _persist_state(live_runner, args)
         emit_status("idle")
         state["ib"].disconnect()
         return 0
@@ -554,6 +631,7 @@ def main() -> int:
                          "ended_at": datetime.now(ET).isoformat(),
                          "severity": "error", "error": str(e),
                          "orders_placed": 0, "fills_received": 0}
+        _persist_state(live_runner, args)
         emit_status("waiting")
 
 

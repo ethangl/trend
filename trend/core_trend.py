@@ -76,6 +76,32 @@ class CoreTrendStrategy:
 
         broker.set_on_fill(self._on_fill)
 
+    # ---- persistence ----
+
+    def to_state_dict(self) -> dict:
+        """Path-dependent state only. Derivable fields (closes, EMAs, std,
+        last_session_date) are recomputed by replay+catch-up, not persisted."""
+        return {
+            "state": self.state.name,
+            "entry_price": self.entry_price,
+            "entry_qty": self.entry_qty,
+            "fav_extreme_close": self.fav_extreme_close,
+            "pending_entry_side": self.pending_entry_side.name
+                                  if self.pending_entry_side else None,
+            "pending_order_id": self.pending_order_id,
+            "trades": [t.to_dict() for t in self.trades],
+        }
+
+    def apply_state_dict(self, d: dict) -> None:
+        self.state = State[d["state"]]
+        self.entry_price = d["entry_price"]
+        self.entry_qty = d["entry_qty"]
+        self.fav_extreme_close = d["fav_extreme_close"]
+        self.pending_entry_side = (Side[d["pending_entry_side"]]
+                                   if d["pending_entry_side"] else None)
+        self.pending_order_id = d["pending_order_id"]
+        self.trades = [TradeRecord.from_dict(t) for t in d["trades"]]
+
     # ---- main bar handler ----
 
     def on_bar(self, bar: Bar) -> None:

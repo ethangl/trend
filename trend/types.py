@@ -43,6 +43,25 @@ class Fill:
     qty: int
     price: float
 
+    def to_dict(self) -> dict:
+        return {
+            "order_id": self.order_id,
+            "ts": self.ts.isoformat(),
+            "side": self.side.name,
+            "qty": self.qty,
+            "price": self.price,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Fill":
+        return cls(
+            order_id=d["order_id"],
+            ts=datetime.fromisoformat(d["ts"]),
+            side=Side[d["side"]],
+            qty=d["qty"],
+            price=d["price"],
+        )
+
 
 @dataclass(frozen=True)
 class Position:
@@ -59,3 +78,24 @@ class TradeRecord:
     entry_price: float
     exit_price: float
     pnl_usd: float
+
+    def to_dict(self) -> dict:
+        return {
+            "session_date": self.session_date.isoformat(),
+            "side": self.side.name,
+            "qty": self.qty,
+            "entry_price": self.entry_price,
+            "exit_price": self.exit_price,
+            "pnl_usd": self.pnl_usd,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TradeRecord":
+        return cls(
+            session_date=date.fromisoformat(d["session_date"]),
+            side=Side[d["side"]],
+            qty=d["qty"],
+            entry_price=d["entry_price"],
+            exit_price=d["exit_price"],
+            pnl_usd=d["pnl_usd"],
+        )
