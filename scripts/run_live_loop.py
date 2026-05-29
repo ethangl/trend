@@ -72,6 +72,35 @@ def connect_ib(host: str, port: int, client_id: int):
     return ib
 
 
+def connect_with_retry(args, *, base_delay: float = 2.0, max_delay: float = 60.0):
+    """Connect to IB, retrying with capped backoff while the gateway is
+    unreachable. IB Gateway logs out / restarts daily (and the API port goes
+    away during that window); without this the loop would crash on the first
+    ConnectionRefused and burn the supervisor's restart budget. Instead we wait
+    it out and reconnect ourselves once the gateway returns.
+
+    The non-paper-account guard inside connect_ib raises SystemExit, which we
+    deliberately do NOT retry — that's a refuse-to-run, not a transient fault.
+    """
+    delay = base_delay
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return connect_ib(args.host, args.port, args.client_id)
+        except SystemExit:
+            raise
+        except Exception as e:
+            # Don't outlive a dead parent while spinning on reconnect.
+            if args.exit_on_orphan and os.getppid() != args._original_ppid:
+                log.warning("parent died during reconnect; exiting")
+                sys.exit(0)
+            log.warning("IB connect attempt %d failed (%s); retrying in %.0fs",
+                        attempt, e, delay)
+            time.sleep(delay)
+            delay = min(delay * 1.5, max_delay)
+
+
 def process_command(cmd: dict, *, runner, ib, args) -> None:
     """Apply one command from the menubar app. Logs everything; no return value.
 
@@ -269,10 +298,19 @@ def sleep_until(ib, target_et: datetime, reconnect,
         if remaining <= 0:
             return
         chunk = min(chunk_secs, remaining)
-        ib.sleep(chunk)
+        try:
+            ib.sleep(chunk)
+        except Exception as e:
+            # A socket disconnect surfaces as an exception out of ib.sleep
+            # (e.g. gateway's daily restart). Don't die — reconnect and keep
+            # counting down. reconnect() blocks via connect_with_retry until
+            # the gateway is back, so this naturally rides out the outage.
+            log.warning("IB error during sleep (%s); reconnecting", e)
+            ib = reconnect()
+            continue
         if not ib.isConnected():
             log.warning("IB connection dropped during sleep; reconnecting")
-            reconnect()
+            ib = reconnect()
         if heartbeat is not None:
             try:
                 heartbeat()
@@ -433,7 +471,8 @@ def main() -> int:
     state = {"ib": None}
 
     def reconnect():
-        state["ib"] = connect_ib(args.host, args.port, args.client_id)
+        state["ib"] = connect_with_retry(args)
+        return state["ib"]
 
     reconnect()
     ib = state["ib"]
