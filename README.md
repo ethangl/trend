@@ -89,6 +89,11 @@ available, full-size where not — see `MARKETS` in
 Four (strategy × market) cells are structurally excluded based on documented
 failure modes — see `scripts/cell_diagnostic.py`.
 
+## Operations
+
+- **IB Gateway auto-login** (IBC + launchd + Keychain, no plaintext password on
+  disk): see [`docs/ib-gateway-autologin.md`](docs/ib-gateway-autologin.md).
+
 ## Path to live
 
 1. ✅ Backtest + OOS validation
