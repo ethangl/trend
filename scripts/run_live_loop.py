@@ -37,9 +37,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.all_strategies_backtest import EXCLUDED_CELLS  # noqa: E402
 from scripts.run_daily_live import (  # noqa: E402
-    CellFill, CellOrder, RunLog, _write_log, build_setups,
-    fetch_all_new_bars, ibkr_positions_by_symbol, qualify_contracts,
+    EXCHANGES, CellFill, CellOrder, RunLog, _write_log, build_setups,
+    compute_roll_basis, fetch_all_new_bars, ibkr_positions_by_symbol,
+    qualify_contracts, resolve_next_contract,
 )
+from trend import roll  # noqa: E402
 from trend.commands import default_command_path, read_and_delete_command  # noqa: E402
 from trend.ib_broker import IBBroker  # noqa: E402
 from trend.ib_data import fetch_daily_bars  # noqa: E402
@@ -57,6 +59,11 @@ log = logging.getLogger("run_live_loop")
 # A session dated D is treated as complete once the clock passes this ET time
 # (CME equity-index close is 17:00 ET; pad for IB's daily-bar publish lag).
 SESSION_COMPLETE_AFTER = dtime(17, 5)
+
+# Physically-deliverable contracts whose First Notice Day precedes expiry — they
+# get the longer roll thresholds so IBKR doesn't liquidate us at FND. (Equity
+# indexes, rates, and currencies are cash-settled / financial → default window.)
+COMMODITY_SYMBOLS = {"MCL", "MGC", "ZC", "ZS"}
 
 
 def connect_ib(host: str, port: int, client_id: int):
@@ -320,6 +327,84 @@ def sleep_until(ib, target_et: datetime, reconnect,
                 log.warning("heartbeat failed: %s", e)
 
 
+def execute_rolls(runner: Runner, ib, contracts: dict, today: date) -> list[str]:
+    """Detect contracts near expiry and roll held positions onto the successor.
+
+    Runs at the top of every tick. For each qualified contract we evaluate roll
+    urgency (commodities get the longer FND-aware window); WARN/ROLL_NOW are
+    logged. On ROLL_NOW we resolve the next listed expiration and, for every
+    cell trading that symbol, close+re-open the position on the new contract
+    (position-neutral) and rebase the strategy's price state by the contract
+    basis so trailing stops / breakouts stay continuous. `contracts` is mutated
+    in place to point at the new front month.
+
+    A roll is deferred (left for the next tick) while any cell for the symbol is
+    mid-order. A half-completed roll raises RollExecutionError out of this
+    function so the tick HALTs rather than carrying a corrupt book.
+
+    Returns the list of symbols rolled this tick.
+    """
+    infos = []
+    for sym, contract in contracts.items():
+        raw = getattr(contract, "lastTradeDateOrContractMonth", "") or ""
+        try:
+            ltd = roll.parse_ib_expiry(raw)
+        except ValueError:
+            log.warning("can't parse expiry %r for %s; skipping roll check", raw, sym)
+            continue
+        infos.append(roll.ContractInfo(
+            symbol=sym,
+            contract_label=getattr(contract, "localSymbol", sym),
+            last_trade_date=ltd,
+        ))
+
+    warnings = runner.check_rolls(infos, today, commodity_symbols=COMMODITY_SYMBOLS)
+    actionable = roll.needs_action(warnings)
+    if actionable:
+        log.warning("roll status:\n%s", roll.format_warnings(actionable))
+
+    rolled: list[str] = []
+    for w in warnings:
+        if w.severity is not roll.Severity.ROLL_NOW:
+            continue
+        sym = w.symbol
+        if runner.symbol_inflight(sym):
+            log.warning("ROLL_NOW for %s but a cell is mid-order; deferring roll", sym)
+            continue
+        old_contract = contracts[sym]
+        exchange = EXCHANGES.get(sym)
+        if exchange is None:
+            log.error("no exchange mapping for %s; cannot roll", sym)
+            continue
+        new_contract = resolve_next_contract(
+            ib, sym, exchange, old_contract.lastTradeDateOrContractMonth
+        )
+        if new_contract is None:
+            log.error("ROLL_NOW for %s but no successor contract resolved", sym)
+            continue
+        if getattr(new_contract, "conId", None) == getattr(old_contract, "conId", None):
+            log.warning("resolved successor for %s equals current contract; skipping", sym)
+            continue
+
+        basis = compute_roll_basis(ib, old_contract, new_contract)
+        log.warning("rolling %s %s → %s (basis=%.4f)",
+                    sym, old_contract.localSymbol, new_contract.localSymbol, basis)
+        for cell in runner.cells_for_symbol(sym):
+            roll_to = getattr(cell.broker, "roll_to", None)
+            if roll_to is None:
+                # SimBroker fallback cell (no live contract) — nothing to roll.
+                continue
+            res = roll_to(new_contract)
+            cell.strategy.rebase_prices(basis)
+            if res.qty != 0:
+                log.warning("  %s×%s rolled %+d @ %.4f→%.4f",
+                            cell.setup.strategy_name, sym, res.qty,
+                            res.close_price, res.open_price)
+        contracts[sym] = new_contract
+        rolled.append(sym)
+    return rolled
+
+
 def do_tick(runner: Runner, ib, contracts: dict, args, first_run: bool,
             fills_cursor: dict) -> RunLog:
     """One daily tick: fetch today's completed bars, feed cells, log.
@@ -349,6 +434,14 @@ def do_tick(runner: Runner, ib, contracts: dict, args, first_run: bool,
     run.reconcile_severity = report.overall.value
     log.info("reconcile severity=%s expected=%s actual=%s",
              report.overall.value, expected, dict(actual))
+
+    # Roll any expiring contracts before fetching/feeding bars, so the day's
+    # bar is pulled from (and any orders route to) the new front month. Runs
+    # even when paused — an expiring position is risk maintenance, not a new
+    # signal. A half-roll raises out of here and HALTs the tick.
+    rolled = execute_rolls(runner, ib, contracts, today_et)
+    if rolled:
+        run.rolled_symbols = rolled
 
     cutoff = session_complete_cutoff(datetime.now(ET))
     new_bars, fetched, missing = fetch_all_new_bars(ib, contracts, today_et)

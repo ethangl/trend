@@ -46,6 +46,40 @@ def days_until(target: date, today: date) -> int:
     return (target - today).days
 
 
+def parse_ib_expiry(s: str) -> date:
+    """Parse an IB `lastTradeDateOrContractMonth` into a date.
+
+    IB returns "YYYYMMDD" for qualified futures and sometimes "YYYYMM" for
+    contract-month-only specs. A month-only value is treated as the 1st.
+    """
+    s = s.strip()
+    if len(s) >= 8:
+        return date(int(s[0:4]), int(s[4:6]), int(s[6:8]))
+    if len(s) == 6:
+        return date(int(s[0:4]), int(s[4:6]), 1)
+    raise ValueError(f"unrecognized IB expiry: {s!r}")
+
+
+def _expiry_key(s: str) -> str:
+    """Sortable 8-char key so "YYYYMM" and "YYYYMMDD" order together."""
+    return s.strip().ljust(8, "0")[:8]
+
+
+def next_expiry(expiries: list[str], current: str) -> str | None:
+    """Pick the expiration immediately after `current` from `expiries`.
+
+    All values are IB `lastTradeDateOrContractMonth` strings. Returns the
+    chronologically-next one strictly after `current`, or None if there is no
+    later contract in the list.
+    """
+    cur_key = _expiry_key(current)
+    later = sorted(
+        (e for e in expiries if _expiry_key(e) > cur_key),
+        key=_expiry_key,
+    )
+    return later[0] if later else None
+
+
 def evaluate(
     info: ContractInfo,
     today: date,

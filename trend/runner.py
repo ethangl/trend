@@ -229,6 +229,21 @@ class Runner:
             commodity_symbols=commodity_symbols,
         )
 
+    def cells_for_symbol(self, symbol: str) -> list[Cell]:
+        """All cells trading `symbol` (one per active strategy)."""
+        return [c for c in self.cells if c.setup.symbol == symbol]
+
+    def symbol_inflight(self, symbol: str) -> bool:
+        """True if any cell for `symbol` is mid-order (state in _INFLIGHT_STATES).
+        A roll must be deferred while an order is in flight — closing/re-opening
+        underneath a pending entry/exit would corrupt the strategy's bookkeeping.
+        """
+        for cell in self.cells_for_symbol(symbol):
+            state_name = getattr(getattr(cell.strategy, "state", None), "name", "")
+            if state_name in self._INFLIGHT_STATES:
+                return True
+        return False
+
     def reset_inflight_strategies(self) -> int:
         """Reset any strategy stuck mid-order (state ending in _SENT) to FLAT.
 

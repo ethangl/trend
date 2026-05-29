@@ -1,5 +1,7 @@
 from datetime import date
 
+import pytest
+
 from trend.roll import (
     ContractInfo,
     Severity,
@@ -7,6 +9,8 @@ from trend.roll import (
     evaluate_all,
     format_warnings,
     needs_action,
+    next_expiry,
+    parse_ib_expiry,
 )
 
 
@@ -85,3 +89,32 @@ def test_needs_action_filters_ok():
     actionable = needs_action(warnings)
     assert len(actionable) == 2
     assert all(w.severity is not Severity.OK for w in actionable)
+
+
+def test_parse_ib_expiry_full_date():
+    assert parse_ib_expiry("20260618") == date(2026, 6, 18)
+
+
+def test_parse_ib_expiry_month_only_is_first():
+    assert parse_ib_expiry("202606") == date(2026, 6, 1)
+
+
+def test_parse_ib_expiry_rejects_garbage():
+    with pytest.raises(ValueError):
+        parse_ib_expiry("2026")
+
+
+def test_next_expiry_picks_successor():
+    expiries = ["20260618", "20260918", "20261218", "20260318"]
+    assert next_expiry(expiries, "20260618") == "20260918"
+
+
+def test_next_expiry_none_when_current_is_latest():
+    expiries = ["20260318", "20260618"]
+    assert next_expiry(expiries, "20260618") is None
+
+
+def test_next_expiry_handles_mixed_formats():
+    # A YYYYMM entry sorts as the start of that month, before YYYYMMDD of same month.
+    expiries = ["202609", "20260618"]
+    assert next_expiry(expiries, "20260618") == "202609"

@@ -25,6 +25,25 @@ from .types import Fill, OrderType, Position, Side
 ET = ZoneInfo("America/New_York")
 
 
+@dataclass(frozen=True)
+class RollResult:
+    """Outcome of a position-neutral contract roll."""
+    qty: int            # signed position migrated (0 = was flat, contract just swapped)
+    close_price: float  # fill price closing the old contract (0.0 if flat)
+    open_price: float   # fill price opening the new contract (0.0 if flat)
+
+    @property
+    def basis(self) -> float:
+        """new − old contract price spread implied by the roll fills."""
+        return self.open_price - self.close_price
+
+
+class RollExecutionError(RuntimeError):
+    """Raised when a roll leaves the broker's position different from before
+    the roll (e.g. the close filled but the re-open did not). The caller must
+    HALT and reconcile rather than silently carry a half-rolled book."""
+
+
 class IBBroker:
     """Live-execution broker for a single futures contract.
 
@@ -142,6 +161,58 @@ class IBBroker:
             "force_close is a backtest-only mechanism. Use place_order with "
             "OrderType.MARKET to flatten a live position."
         )
+
+    # ---- roll ----
+
+    def roll_to(self, new_contract: Any, settle_secs: float = 2.0) -> RollResult:
+        """Migrate the held position from `self.contract` to `new_contract`.
+
+        Position-neutral: closes the held qty on the OLD contract with a MARKET
+        order, swaps `self.contract`, then re-opens the same signed qty on the
+        NEW contract with a MARKET order. Normal `place_order` bookkeeping does
+        the rest — the close realizes P&L at the old contract's price and the
+        re-open re-bases `position_avg` to the new contract's price.
+
+        The cell's strategy is NOT driven through its state machine here (these
+        fills carry roll order-ids that match no pending entry/exit, so the
+        strategy ignores them) — strategy state is preserved across the roll.
+
+        A flat broker just swaps the contract reference (no orders). If, after
+        re-opening, the position doesn't match what we started with (e.g. the
+        close filled but the open didn't), raises RollExecutionError so the
+        caller can HALT instead of silently carrying a half-rolled book.
+        """
+        qty = self.position_qty
+        if qty == 0:
+            self.contract = new_contract
+            return RollResult(qty=0, close_price=0.0, open_price=0.0)
+
+        close_side = Side.SHORT if qty > 0 else Side.LONG
+        open_side = Side.LONG if qty > 0 else Side.SHORT
+
+        before = len(self.fills)
+        self.place_order(close_side, abs(qty), OrderType.MARKET, 0.0)
+        self.ib.sleep(settle_secs)
+        if self.position_qty != 0:
+            raise RollExecutionError(
+                f"roll close did not flatten: position_qty={self.position_qty} "
+                f"after closing {qty} on {getattr(self.contract, 'localSymbol', '?')}"
+            )
+
+        self.contract = new_contract
+        self.place_order(open_side, abs(qty), OrderType.MARKET, 0.0)
+        self.ib.sleep(settle_secs)
+        if self.position_qty != qty:
+            raise RollExecutionError(
+                f"roll re-open mismatch: expected position_qty={qty}, got "
+                f"{self.position_qty} on "
+                f"{getattr(new_contract, 'localSymbol', '?')}"
+            )
+
+        roll_fills = self.fills[before:]
+        close_price = roll_fills[0].price if len(roll_fills) >= 1 else 0.0
+        open_price = roll_fills[-1].price if len(roll_fills) >= 2 else 0.0
+        return RollResult(qty=qty, close_price=close_price, open_price=open_price)
 
     # ---- IB event handler ----
 

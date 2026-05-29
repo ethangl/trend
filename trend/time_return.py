@@ -87,6 +87,21 @@ class TimeReturnStrategy:
         self.pending_open_signed_qty = d["pending_open_signed_qty"]
         self.trades = [TradeRecord.from_dict(t) for t in d["trades"]]
 
+    # ---- roll ----
+
+    def rebase_prices(self, basis: float) -> None:
+        """Shift price-level state by `basis` (new − old contract price) to keep
+        the close series continuous across a futures roll. This model has no
+        EMAs; only the close history and the open position's entry matter."""
+        if not basis:
+            return
+        if self.closes:
+            self.closes = deque(
+                (c + basis for c in self.closes), maxlen=self.closes.maxlen
+            )
+        if self.entry_price is not None:
+            self.entry_price += basis
+
     # ---- bar handler ----
 
     def on_bar(self, bar: Bar) -> None:

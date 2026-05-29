@@ -1,15 +1,16 @@
+.env
+.DS_Store
+
+book/
+data/
+logs/
+results/
+
 __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
 *.egg-info/
-data/
-results/
-.env
-.DS_Store
-book
-
-logs/
 
 # Xcode (per-user Xcode state, build output, sed backups)
 xcuserdata/

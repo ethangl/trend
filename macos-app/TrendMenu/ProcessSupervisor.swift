@@ -36,7 +36,10 @@ final class ProcessSupervisor: ObservableObject, @unchecked Sendable {
         // --exit-on-orphan: if Xcode kills us via ⌘R (which bypasses
         // applicationWillTerminate), the child detects the reparenting and
         // exits cleanly instead of holding the IB clientId.
-        self.extraArgs = ["--skip-symbols", "MBT,MET", "--exit-on-orphan"]
+        // MBT/MET are no longer skipped — the loop now rolls futures in-process
+        // (execute_rolls in run_live_loop.py), so a held crypto position
+        // migrates to the new front month instead of expiring.
+        self.extraArgs = ["--exit-on-orphan"]
         self.logPath = "\(home)/w/trend/logs/loop-supervised.log"
     }
 

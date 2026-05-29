@@ -82,6 +82,23 @@ class CounterTrendStrategy:
         self.pending_order_id = d["pending_order_id"]
         self.trades = [TradeRecord.from_dict(t) for t in d["trades"]]
 
+    def rebase_prices(self, basis: float) -> None:
+        """Shift every price-level field by `basis` (new − old contract price)
+        so the strategy stays continuous across a futures roll. Diff-based stats
+        (std) are shift-invariant; trade records are left untouched."""
+        if not basis:
+            return
+        if self.closes:
+            self.closes = deque(
+                (c + basis for c in self.closes), maxlen=self.closes.maxlen
+            )
+        if self.ema_fast is not None:
+            self.ema_fast += basis
+        if self.ema_slow is not None:
+            self.ema_slow += basis
+        if self.entry_price is not None:
+            self.entry_price += basis
+
     def on_bar(self, bar: Bar) -> None:
         self.last_session_date = bar.ts.date()
         self.closes.append(bar.close)

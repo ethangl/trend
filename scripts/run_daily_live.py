@@ -88,6 +88,7 @@ class RunLog:
     expected_positions: dict[str, int] = field(default_factory=dict)
     reconcile_severity: str = ""
     reconcile_halted: bool = False
+    rolled_symbols: list[str] = field(default_factory=list)
     orders_placed: list[CellOrder] = field(default_factory=list)
     fills_received: list[CellFill] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -131,6 +132,62 @@ def qualify_contracts(ib: Any, symbols: list[str]) -> dict[str, Any]:
                  sym, qualified[0].localSymbol,
                  qualified[0].lastTradeDateOrContractMonth)
     return out
+
+
+def resolve_next_contract(
+    ib: Any, symbol: str, exchange: str, after_expiry: str
+) -> Any | None:
+    """Qualify the futures contract whose expiry is immediately after
+    `after_expiry`. ContFuture only ever resolves the front month, so we
+    enumerate listed expirations via reqContractDetails and pick the successor.
+
+    Returns a fully-qualified `Future` (with conId) or None if no later
+    contract is listed / qualification fails.
+    """
+    from ib_async import Future
+
+    from trend.roll import next_expiry
+
+    try:
+        details = ib.reqContractDetails(
+            Future(symbol=symbol, exchange=exchange, currency="USD")
+        )
+    except Exception as e:
+        log.error("reqContractDetails failed for %s on %s: %s", symbol, exchange, e)
+        return None
+    expiries = [d.contract.lastTradeDateOrContractMonth for d in details
+                if d.contract.lastTradeDateOrContractMonth]
+    nxt = next_expiry(expiries, after_expiry)
+    if nxt is None:
+        log.error("no expiry after %s for %s (listed: %s)",
+                  after_expiry, symbol, sorted(set(expiries)))
+        return None
+    fut = Future(symbol=symbol, exchange=exchange, currency="USD",
+                 lastTradeDateOrContractMonth=nxt)
+    try:
+        qualified = ib.qualifyContracts(fut)
+    except Exception as e:
+        log.error("qualifyContracts failed for %s %s: %s", symbol, nxt, e)
+        return None
+    if not qualified or not qualified[0].conId:
+        log.error("could not qualify %s expiry %s", symbol, nxt)
+        return None
+    return qualified[0]
+
+
+def compute_roll_basis(ib: Any, old_contract: Any, new_contract: Any) -> float:
+    """Estimate the new − old contract price spread from each contract's most
+    recent daily close. Returns 0.0 if either fetch is unusable (the roll then
+    proceeds without rebasing — a small discontinuity, logged by the caller)."""
+    try:
+        old_bars = fetch_daily_bars(ib, old_contract, n_bars=1)
+        new_bars = fetch_daily_bars(ib, new_contract, n_bars=1)
+    except Exception as e:
+        log.error("roll basis fetch failed: %s", e)
+        return 0.0
+    if not old_bars or not new_bars:
+        return 0.0
+    return new_bars[-1].close - old_bars[-1].close
 
 
 def ibkr_positions_by_symbol(ib: Any) -> dict[str, int]:
