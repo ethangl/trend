@@ -47,6 +47,7 @@ class CoreTrendConfig:
     portfolio_value_usd: float = 300_000.0
     point_value: float = 5.0
     max_contracts: int = 100  # safety cap so quiet markets can't blow up qty
+    risk_multiplier: float = 1.0  # portfolio-level overlay (IDM × vol-target); 1.0 = off
 
 
 class CoreTrendStrategy:
@@ -198,7 +199,8 @@ class CoreTrendStrategy:
         return var ** 0.5
 
     def _size(self, std: float) -> int:
-        target = self.cfg.portfolio_value_usd * self.cfg.risk_factor
+        target = (self.cfg.portfolio_value_usd * self.cfg.risk_factor
+                  * self.cfg.risk_multiplier)
         denom = std * self.cfg.point_value
         if denom <= 0:
             return 0

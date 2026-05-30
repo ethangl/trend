@@ -41,6 +41,26 @@ def test_runner_builds_cells_and_skips_exclusions(tiny_csv):
     assert ("TimeReturn", "MES") not in names
 
 
+def test_set_risk_multiplier_scales_every_cell_and_sizing(tiny_csv):
+    setups = [
+        CellSetup("CoreTrend",    "MES", str(tiny_csv), 5.0),
+        CellSetup("TimeReturn",   "MES", str(tiny_csv), 5.0),
+        CellSetup("CounterTrend", "MES", str(tiny_csv), 5.0),
+    ]
+    runner = Runner.from_setups(setups, excluded=set())
+    # Default is the no-op multiplier.
+    for cell in runner.cells:
+        assert cell.strategy.cfg.risk_multiplier == 1.0
+    # std=10 -> base qty 6, comfortably below max_contracts so 2x doesn't clip.
+    base_qty = runner.cells[0].strategy._size(10.0)
+
+    runner.set_risk_multiplier(2.0)
+    for cell in runner.cells:
+        assert cell.strategy.cfg.risk_multiplier == 2.0
+    # Sizing scales with the multiplier (linear up to the int floor / cap).
+    assert runner.cells[0].strategy._size(10.0) == pytest.approx(2 * base_qty, abs=1)
+
+
 def test_replay_brings_strategies_to_today(tiny_csv):
     setups = [CellSetup("CoreTrend", "MES", str(tiny_csv), 5.0)]
     runner = Runner.from_setups(setups, excluded=set())

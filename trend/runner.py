@@ -229,6 +229,19 @@ class Runner:
             commodity_symbols=commodity_symbols,
         )
 
+    def set_risk_multiplier(self, multiplier: float) -> None:
+        """Set the portfolio-level risk multiplier on every cell's strategy config.
+
+        This is the hook the IDM × vol-target overlay feeds: compute the current
+        multiplier from realized portfolio history (see `trend.risk_overlay`),
+        then push it here so every cell's next-entry sizing is scaled uniformly.
+        Cells re-size only on new entries (Clenow holds size while in a position),
+        so the multiplier takes effect as positions naturally turn over."""
+        for cell in self.cells:
+            cfg = getattr(cell.strategy, "cfg", None)
+            if cfg is not None and hasattr(cfg, "risk_multiplier"):
+                cfg.risk_multiplier = multiplier
+
     def cells_for_symbol(self, symbol: str) -> list[Cell]:
         """All cells trading `symbol` (one per active strategy)."""
         return [c for c in self.cells if c.setup.symbol == symbol]
