@@ -48,7 +48,7 @@ from trend.ib_data import fetch_daily_bars  # noqa: E402
 from trend.persistence import (  # noqa: E402
     StatePersistenceError, default_state_path, load_state, save_state,
 )
-from trend.reconcile import format_report  # noqa: E402
+from trend.reconcile import Severity, format_report  # noqa: E402
 from trend.runner import CellSetup, Runner, transfer_warm_state  # noqa: E402
 from trend.sim_broker import SimBroker  # noqa: E402
 from trend.status import SCHEMA_VERSION, default_status_path, write_status  # noqa: E402
@@ -435,6 +435,22 @@ def do_tick(runner: Runner, ib, contracts: dict, args, first_run: bool,
     log.info("reconcile severity=%s expected=%s actual=%s",
              report.overall.value, expected, dict(actual))
 
+    # HALT enforcement. A position mismatch beyond threshold means our book and
+    # IBKR's disagree — acting on it could place orders against a corrupted
+    # position map (e.g. "close" a position IB doesn't have -> open a real one
+    # the wrong way). The single-shot run_daily_live returns here; the loop must
+    # do the same: skip rolls AND the bar tick, log loudly, and keep skipping
+    # every tick until an operator resolves the mismatch (flatten / fix state).
+    # The status.json heartbeat already surfaces severity=halt to the menubar.
+    if report.overall is Severity.HALT:
+        run.reconcile_halted = True
+        run.errors.append("reconcile severity=HALT — skipped tick (no rolls, no orders)")
+        log.error("reconcile HALT (expected=%s actual=%s); skipping tick until "
+                  "the mismatch is resolved", expected, dict(actual))
+        run.ended_at = datetime.now(ET).isoformat()
+        _write_log(args.logfile, run)
+        return run
+
     # Roll any expiring contracts before fetching/feeding bars, so the day's
     # bar is pulled from (and any orders route to) the new front month. Runs
     # even when paused — an expiring position is risk maintenance, not a new
@@ -632,10 +648,10 @@ def main() -> int:
         args._paused = bool(persisted.get("global", {}).get("paused", False))
         log.warning(
             "restored %d cells (%d degraded mid-order), %d in-state cells "
-            "missing from runner, %d new cells left at default; paused=%s",
+            "missing from runner, %d new cells force-flat; paused=%s",
             len(summary["applied"]), len(summary["degraded"]),
             len(summary["skipped_missing_from_runner"]),
-            len(summary["new_cells_left_default"]), args._paused,
+            len(summary["new_cells_force_flat"]), args._paused,
         )
         if summary["degraded"]:
             log.warning("degraded (force-flat + reset to FLAT, reconcile will "
@@ -643,9 +659,9 @@ def main() -> int:
         if summary["skipped_missing_from_runner"]:
             log.warning("state had cells not in this runner (skipped): %s",
                         summary["skipped_missing_from_runner"])
-        if summary["new_cells_left_default"]:
-            log.warning("runner has cells not in state (left at replay default): %s",
-                        summary["new_cells_left_default"])
+        if summary["new_cells_force_flat"]:
+            log.warning("cells not in state (new market added) force-flat to "
+                        "match the account: %s", summary["new_cells_force_flat"])
     else:
         first_run = not args.no_first_run
         if first_run:

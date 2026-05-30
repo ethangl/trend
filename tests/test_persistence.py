@@ -52,7 +52,7 @@ def test_snapshot_apply_round_trip(tiny_csv):
     summary = dst.apply_persisted_state(snap)
 
     assert summary["skipped_missing_from_runner"] == []
-    assert summary["new_cells_left_default"] == []
+    assert summary["new_cells_force_flat"] == []
 
     for sc, dc in zip(src.cells, dst.cells):
         # Settled cells (not mid-order) must match exactly.
@@ -109,19 +109,29 @@ def test_apply_skips_cell_missing_from_runner(tiny_csv):
     summary = dst.apply_persisted_state(snap)
 
     assert "TimeReturn×MNQ" in summary["skipped_missing_from_runner"]
-    assert summary["new_cells_left_default"] == []
+    assert summary["new_cells_force_flat"] == []
 
 
-def test_apply_leaves_new_cell_at_default(tiny_csv):
+def test_apply_force_flats_new_cell(tiny_csv):
+    # A cell present in the runner but absent from the saved state is a newly
+    # added market: it can't hold a real IB position yet, so it must be forced
+    # flat (not left at the position it built during replay) — the fix for the
+    # MET -24 phantom-position HALT.
     src = Runner.from_setups(_setups(tiny_csv)[:2], excluded=set())
     src.replay_history()
     snap = src.snapshot_cells()
 
     dst = Runner.from_setups(_setups(tiny_csv), excluded=set())
     dst.replay_history()
+    new_cell = next(c for c in dst.cells
+                    if (c.setup.strategy_name, c.setup.symbol) == ("TimeReturn", "MNQ"))
     summary = dst.apply_persisted_state(snap)
 
-    assert "TimeReturn×MNQ" in summary["new_cells_left_default"]
+    assert "TimeReturn×MNQ" in summary["new_cells_force_flat"]
+    # Forced genuinely flat: broker zeroed AND strategy lifecycle reset.
+    assert new_cell.broker.position_qty == 0
+    assert new_cell.broker.position_avg == 0.0
+    assert new_cell.strategy.state is type(new_cell.strategy.state).FLAT
 
 
 def test_inflight_cell_is_degraded(tiny_csv):

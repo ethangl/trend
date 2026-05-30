@@ -337,7 +337,13 @@ class Runner:
             key = (cell.setup.strategy_name, cell.setup.symbol)
             cstate = by_key.get(key)
             if cstate is None:
-                continue  # new cell — leave at replay default
+                # New cell — a market just added to the config. It CANNOT hold a
+                # real IB position yet (the live system never traded it), so
+                # force it flat to match the account. Leaving it at the position
+                # it built during replay would inject a phantom that reconcile
+                # then HALTs on (the MET -24 incident).
+                self._force_flat_cell(cell)
+                continue
             b = cell.broker
             bs = cstate["broker"]
             b.position_qty = bs["position_qty"]
@@ -357,13 +363,7 @@ class Runner:
 
             state_name = getattr(getattr(cell.strategy, "state", None), "name", "")
             if state_name in self._INFLIGHT_STATES:
-                b.position_qty = 0
-                b.position_avg = 0.0
-                cell.strategy.state = type(cell.strategy.state).FLAT
-                for attr in ("pending_order_id", "pending_close_id",
-                             "pending_open_id"):
-                    if hasattr(cell.strategy, attr):
-                        setattr(cell.strategy, attr, None)
+                self._force_flat_cell(cell)
                 degraded.append(f"{key[0]}×{key[1]}")
             else:
                 applied.append(f"{key[0]}×{key[1]}")
@@ -376,8 +376,30 @@ class Runner:
             "applied": applied,
             "degraded": degraded,
             "skipped_missing_from_runner": missing,
-            "new_cells_left_default": new_cells,
+            "new_cells_force_flat": new_cells,
         }
+
+    @staticmethod
+    def _force_flat_cell(cell) -> None:
+        """Zero a cell's broker position and reset its strategy lifecycle to
+        flat (state -> FLAT, pending order ids cleared). Derivable indicator
+        state (EMAs, std, deques) is left warm so the strategy re-signals
+        normally on its next bar. Shared by the degraded-resume and new-cell
+        paths so both leave the cell genuinely flat, not just zeroed at the
+        broker (which would strand the strategy thinking it still holds)."""
+        b = cell.broker
+        b.position_qty = 0
+        b.position_avg = 0.0
+        strat = cell.strategy
+        state = getattr(strat, "state", None)
+        if state is not None:
+            try:
+                strat.state = type(state).FLAT
+            except AttributeError:
+                pass
+        for attr in ("pending_order_id", "pending_close_id", "pending_open_id"):
+            if hasattr(strat, attr):
+                setattr(strat, attr, None)
 
     def force_flat_all_cells(self) -> None:
         """Reset every cell's broker position to flat, without placing orders.
