@@ -44,13 +44,20 @@ def default_state_path() -> Path:
 
 def save_state(path: str | os.PathLike, runner, args) -> None:
     """Atomically write the runner's path-dependent state to `path`."""
+    global_state = {
+        "paused": bool(getattr(args, "_paused", False)),
+        "skip": sorted(getattr(args, "_skip", set())),
+    }
+    overlay = getattr(args, "_overlay", None)
+    if overlay is not None:
+        # Persist the vol-target controller's trailing-vol estimate so it
+        # resumes instead of cold-starting at multiplier 1.0 on every restart.
+        global_state["risk_overlay"] = overlay.to_dict()
+
     state = {
         "schema_version": SCHEMA_VERSION,
         "saved_at": datetime.now(ET).isoformat(),
-        "global": {
-            "paused": bool(getattr(args, "_paused", False)),
-            "skip": sorted(getattr(args, "_skip", set())),
-        },
+        "global": global_state,
         "cells": runner.snapshot_cells(),
     }
     p = Path(path)

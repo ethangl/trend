@@ -80,6 +80,27 @@ def test_save_load_file_round_trip(tiny_csv, tmp_path):
     assert len(loaded["cells"]) == len(src.cells)
 
 
+def test_risk_overlay_persists_and_restores(tiny_csv, tmp_path):
+    from trend.risk_overlay import RiskOverlayController
+
+    src = Runner.from_setups(_setups(tiny_csv), excluded=set())
+    src.replay_history()
+    args = _fake_args()
+    overlay = RiskOverlayController(0.10, span=20, min_periods=5)
+    for r in [0.004, -0.003, 0.005, -0.002, 0.006, -0.004, 0.003]:
+        overlay.update(r)
+    args._overlay = overlay
+    path = tmp_path / "state.json"
+
+    save_state(path, src, args)
+    loaded = load_state(path)
+    assert "risk_overlay" in loaded["global"]
+
+    restored = RiskOverlayController.from_dict(loaded["global"]["risk_overlay"])
+    assert restored.multiplier == overlay.multiplier
+    assert restored.trailing_vol == overlay.trailing_vol
+
+
 def test_load_missing_returns_none(tmp_path):
     assert load_state(tmp_path / "nope.json") is None
 

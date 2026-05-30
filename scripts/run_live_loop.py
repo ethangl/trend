@@ -49,6 +49,7 @@ from trend.persistence import (  # noqa: E402
     StatePersistenceError, default_state_path, load_state, save_state,
 )
 from trend.reconcile import Severity, format_report  # noqa: E402
+from trend.risk_overlay import RiskOverlayController  # noqa: E402
 from trend.runner import CellSetup, Runner, transfer_warm_state  # noqa: E402
 from trend.sim_broker import SimBroker  # noqa: E402
 from trend.status import SCHEMA_VERSION, default_status_path, write_status  # noqa: E402
@@ -288,6 +289,8 @@ def build_status(*, runner: Runner | None, ib, args, status: str,
         "recent_fills": recent_fills_payload(runner) if runner else [],
         "recent_errors": recent_errors or [],
         "paused": getattr(args, "_paused", False),
+        "risk_multiplier": round(args._overlay.multiplier, 3)
+                           if getattr(args, "_overlay", None) else 1.0,
     }
 
 
@@ -405,6 +408,48 @@ def execute_rolls(runner: Runner, ib, contracts: dict, today: date) -> list[str]
     return rolled
 
 
+def update_risk_overlay(runner: Runner, args, new_bars: dict) -> None:
+    """Feed the day's portfolio return to the vol-target overlay and push the new
+    multiplier onto every cell's sizing.
+
+    Causal: the multiplier we compute from today's close applies to *future*
+    entries. The day's mark-to-market P&L is (position carried into today) x
+    (close move) x point_value, summed across symbols and divided by the
+    portfolio. We de-lever by the multiplier that was in force (positions were
+    sized at it) to recover the underlying vol the controller targets. State
+    (`args._mtm_state`) carries prior closes/positions across ticks; the overlay
+    controller itself is persisted in state.json, so the vol estimate survives
+    restarts. No-op until `--vol-target` is set."""
+    overlay = getattr(args, "_overlay", None)
+    if overlay is None:
+        return
+    mtm = args._mtm_state
+    pv = args._pv_by_symbol
+
+    pnl = 0.0
+    have_prev = False
+    for sym, bar in new_bars.items():
+        prev_close = mtm["close"].get(sym)
+        if prev_close is not None:
+            have_prev = True
+            pnl += mtm["pos"].get(sym, 0) * (bar.close - prev_close) * pv.get(sym, 0.0)
+        mtm["close"][sym] = bar.close
+    mtm["pos"] = dict(runner.positions_by_symbol())
+
+    if not have_prev:
+        return  # first observation since (re)start — seed only, nothing to feed
+
+    ret = pnl / args.portfolio
+    in_force = overlay.multiplier or 1.0
+    underlying = ret / in_force
+    new_mult = overlay.update(underlying)
+    runner.set_risk_multiplier(new_mult)
+    tv = overlay.trailing_vol
+    log.info("risk overlay: day_ret=%+.3f%% underlying=%+.3f%% trailing_vol=%s mult=%.3f",
+             ret * 100, underlying * 100,
+             f"{tv*100:.1f}%" if tv is not None else "warmup", new_mult)
+
+
 def do_tick(runner: Runner, ib, contracts: dict, args, first_run: bool,
             fills_cursor: dict) -> RunLog:
     """One daily tick: fetch today's completed bars, feed cells, log.
@@ -514,6 +559,9 @@ def do_tick(runner: Runner, ib, contracts: dict, args, first_run: bool,
                 late_fills += 1
         fills_cursor[id(cell)] = current
 
+    # Vol-target overlay: update the portfolio risk multiplier from today's MTM.
+    update_risk_overlay(runner, args, new_bars)
+
     run.ended_at = datetime.now(ET).isoformat()
     log.info("tick done: %d orders, %d fills%s",
              len(run.orders_placed), len(run.fills_received),
@@ -529,6 +577,12 @@ def main() -> int:
     p.add_argument("--client-id", type=int, default=14)
     p.add_argument("--portfolio", type=float, default=300_000.0)
     p.add_argument("--risk-factor", type=float, default=0.001)
+    p.add_argument("--vol-target", type=float, default=0.10,
+                   help="annualized vol target for the portfolio risk overlay; "
+                        "0 disables. Multiplier scales all cell sizing toward it.")
+    p.add_argument("--overlay-span", type=int, default=63,
+                   help="EWMA span (trading days) for the overlay's trailing vol")
+    p.add_argument("--overlay-leverage-cap", type=float, default=3.0)
     # 18:15 ET is just after the 18:00 ET CME maintenance-halt reopen, so the
     # day's bar is already settled (>17:05) AND the market is live — MARKET
     # orders fill immediately instead of resting as _SENT through the
@@ -670,6 +724,31 @@ def main() -> int:
             unstuck = live_runner.reset_inflight_strategies()
             if unstuck:
                 log.warning("reset %d strategies stuck in *_SENT state", unstuck)
+
+    # ---- Vol-target risk overlay ----
+    # Restore the controller's trailing-vol estimate from state if present so it
+    # doesn't cold-start on every restart; otherwise build fresh. Then apply its
+    # current multiplier to sizing and seed the per-tick MTM tracker.
+    args._overlay = None
+    if args.vol_target and args.vol_target > 0:
+        ov_state = (persisted or {}).get("global", {}).get("risk_overlay")
+        if ov_state:
+            overlay = RiskOverlayController.from_dict(ov_state)
+            overlay.target_ann_vol = args.vol_target  # CLI wins if it changed
+        else:
+            overlay = RiskOverlayController(
+                args.vol_target, span=args.overlay_span,
+                leverage_cap=args.overlay_leverage_cap)
+        args._overlay = overlay
+        args._pv_by_symbol = {c.setup.symbol: c.setup.point_value
+                              for c in live_runner.cells}
+        args._mtm_state = {"close": {}, "pos": dict(live_runner.positions_by_symbol())}
+        live_runner.set_risk_multiplier(overlay.multiplier)
+        log.warning("risk overlay ON: target=%.0f%% vol, span=%d, cap=%.1fx, "
+                    "current mult=%.3f (trailing_vol=%s)",
+                    args.vol_target * 100, args.overlay_span,
+                    args.overlay_leverage_cap, overlay.multiplier,
+                    f"{overlay.trailing_vol*100:.1f}%" if overlay.trailing_vol else "warmup")
 
     actual = ibkr_positions_by_symbol(ib)
     report = live_runner.reconcile_against(actual, halt_threshold=args.halt_threshold)
